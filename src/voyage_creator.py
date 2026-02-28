@@ -1,6 +1,4 @@
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import Point
 
 from src.port_matcher import PortMatcher
 
@@ -51,19 +49,7 @@ class VoyageCreator:
         -------
         DataFrame with columns: mmsi, portName, entry_time, exit_time, duration_hours
         """
-        ais_df = ais_df.copy()
-        ais_df[timestamp_col] = pd.to_datetime(ais_df[timestamp_col])
-
-        slow = ais_df[ais_df['sog'] <= self.matcher.max_speed].copy()
-
-        geometry = [Point(lon, lat) for lon, lat in zip(slow['longitude'], slow['latitude'])]
-        slow_gdf = gpd.GeoDataFrame(slow, geometry=geometry, crs='EPSG:4326').to_crs('EPSG:3857')
-
-        ports_proj = self.matcher.ports[['portName', 'geometry']].copy().to_crs('EPSG:3857')
-        ports_proj['geometry'] = ports_proj.geometry.buffer(self.matcher.radius_m)
-
-        near_port = slow_gdf.sjoin(ports_proj, predicate='within').drop(columns='index_right')
-
+        near_port = self.matcher.find_candidates(ais_df, timestamp_col=timestamp_col)
         return self._split_visits(near_port, timestamp_col)
 
     def _split_visits(self, near_port_df, timestamp_col):
@@ -95,7 +81,8 @@ class VoyageCreator:
             .reset_index(drop=True)
         )
 
-    def label_pings(self, ais_df, port_visits, timestamp_col='base_date_time'):
+    @staticmethod
+    def label_pings(ais_df, port_visits, timestamp_col='base_date_time'):
         """
         Add current_port, origin_port, destination_port, and voyage_id columns
         to every AIS ping.
@@ -163,7 +150,8 @@ class VoyageCreator:
 
         return pings_sorted.sort_values(['mmsi', timestamp_col]).reset_index(drop=True)
 
-    def build_voyages(self, df_labeled, port_visits, timestamp_col='base_date_time'):
+    @staticmethod
+    def build_voyages(df_labeled, port_visits, timestamp_col='base_date_time'):
         """
         Group consecutive port visits into voyage records and stamp each sea
         ping with its voyage_id.
