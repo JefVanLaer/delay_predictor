@@ -14,6 +14,47 @@ class PortMatcher:
         self.max_speed = max_speed_knots
         self.min_time_in_port = min_time_in_port
 
+    def find_candidates(self, ais_df, lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
+        """
+        Return all slow-moving AIS pings that fall within a port buffer, with
+        a portName column attached. No duration filtering is applied.
+
+        Parameters:
+        -----------
+        ais_df : pandas.DataFrame
+            Input AIS data
+        lat_col : str
+            Name of latitude column (default: 'latitude')
+        lon_col : str
+            Name of longitude column (default: 'longitude')
+        timestamp_col : str
+            Name of timestamp column. Converted to datetime if provided.
+
+        Returns:
+        --------
+        GeoDataFrame with all original columns plus portName
+        """
+        candidates = ais_df[ais_df['sog'] <= self.max_speed].copy()
+
+        if timestamp_col is not None:
+            candidates[timestamp_col] = pd.to_datetime(candidates[timestamp_col])
+
+        geometry = [Point(xy) for xy in zip(candidates[lon_col], candidates[lat_col])]
+        candidates_gdf = GeoDataFrame(candidates, geometry=geometry, crs='EPSG:4326')
+
+        ports_buffered = self.ports.copy()
+        if ports_buffered.crs != candidates_gdf.crs:
+            ports_buffered = ports_buffered.to_crs(candidates_gdf.crs)
+
+        ports_buffered = ports_buffered.to_crs('EPSG:3857')
+        candidates_gdf = candidates_gdf.to_crs('EPSG:3857')
+        ports_buffered['geometry'] = ports_buffered.geometry.buffer(self.radius_m)
+
+        return candidates_gdf.sjoin(
+            ports_buffered[['portName', 'geometry']],
+            predicate='within'
+        )
+
     def match(self, ais_df, lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
         """
         For each AIS record, find the nearest port within radius_m
@@ -32,31 +73,7 @@ class PortMatcher:
         timestamp_col : str
             Name of timestamp column. If provided, will be converted to datetime
         """
-        # filter to slow-moving records first
-        candidates = ais_df[ais_df['sog'] <= self.max_speed].copy()
-
-        # convert timestamp column to datetime if provided
-        if timestamp_col is not None:
-            candidates[timestamp_col] = pd.to_datetime(candidates[timestamp_col])
-
-        # convert pandas dataframe to geopandas dataframe
-        geometry = [Point(xy) for xy in zip(candidates[lon_col], candidates[lat_col])]
-        candidates_gdf = GeoDataFrame(candidates, geometry=geometry, crs='EPSG:4326')
-
-        # ensure ports have same CRS
-        ports_buffered = self.ports.copy()
-        if ports_buffered.crs != candidates_gdf.crs:
-            ports_buffered = ports_buffered.to_crs(candidates_gdf.crs)
-
-        # buffer in a projected CRS (meters) for accurate distances
-        ports_buffered = ports_buffered.to_crs('EPSG:3857')  # Web Mercator
-        candidates_gdf = candidates_gdf.to_crs('EPSG:3857')
-        ports_buffered['geometry'] = ports_buffered.geometry.buffer(self.radius_m)
-
-        matched = candidates_gdf.sjoin(
-            ports_buffered[['portName', 'geometry']],
-            predicate='within'
-        )
+        matched = self.find_candidates(ais_df, lat_col=lat_col, lon_col=lon_col, timestamp_col=timestamp_col)
 
         # Filter to only stays longer than min_time_in_port
         matched_with_duration = self.calculate_port_duration(matched, timestamp_col=timestamp_col)
