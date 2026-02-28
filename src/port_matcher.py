@@ -2,28 +2,45 @@ from geopandas import GeoDataFrame, read_file
 from shapely.geometry import Point
 import matplotlib.pyplot as plt
 import folium
+import pandas as pd
 
 class PortMatcher:
 
     us_filepath = "https://www2.census.gov/geo/tiger/GENZ2022/shp/cb_2022_us_state_500k.zip"
 
-    def __init__(self, ports_gdf, radius_nm=10, max_speed_knots=1.5):
+    def __init__(self, ports_gdf, radius_nm=10, max_speed_knots=1.5, min_time_in_port=1):
         self.ports = ports_gdf
         self.radius_m = radius_nm * 1852  # convert to metres
         self.max_speed = max_speed_knots
+        self.min_time_in_port = min_time_in_port
 
-    def match(self, ais_df):
+    def match(self, ais_df, lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
         """
         For each AIS record, find the nearest port within radius_m
         where SOG is below max_speed. Takes a pandas DataFrame with
         latitude and longitude columns. Returns GeoDataFrame with a new
         portName column.
+
+        Parameters:
+        -----------
+        ais_df : pandas.DataFrame
+            Input AIS data
+        lat_col : str
+            Name of latitude column (default: 'latitude')
+        lon_col : str
+            Name of longitude column (default: 'longitude')
+        timestamp_col : str
+            Name of timestamp column. If provided, will be converted to datetime
         """
         # filter to slow-moving records first
         candidates = ais_df[ais_df['sog'] <= self.max_speed].copy()
 
+        # convert timestamp column to datetime if provided
+        if timestamp_col is not None:
+            candidates[timestamp_col] = pd.to_datetime(candidates[timestamp_col])
+
         # convert pandas dataframe to geopandas dataframe
-        geometry = [Point(xy) for xy in zip(candidates['longitude'], candidates['latitude'])]
+        geometry = [Point(xy) for xy in zip(candidates[lon_col], candidates[lat_col])]
         candidates_gdf = GeoDataFrame(candidates, geometry=geometry, crs='EPSG:4326')
 
         # ensure ports have same CRS
@@ -41,8 +58,46 @@ class PortMatcher:
             predicate='within'
         )
 
+        # Filter to only stays longer than min_time_in_port
+        matched_with_duration = self.calculate_port_duration(matched, timestamp_col=timestamp_col)
+        filtered = matched_with_duration[matched_with_duration['duration_hours'] >= self.min_time_in_port]
+
         # return unique mmsi and portName combinations
-        return matched[['mmsi', 'portName']].drop_duplicates()
+        return filtered[['mmsi', 'portName']].drop_duplicates()
+
+    @staticmethod
+    def calculate_port_duration(matched_df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
+        """
+        Calculate the duration of stay in port for each matched port visit.
+        Filters the matches to only include stays longer than self.min_time_in_port (in hours).
+
+        Parameters:
+        -----------
+        matched_df : pandas.DataFrame
+            Output from match() method with 'mmsi' and 'portName' columns
+        timestamp_col : str
+            Name of the timestamp column (default: 'timestamp')
+
+        Returns:
+        --------
+        pandas.DataFrame
+            DataFrame with duration_hours column
+        """
+        # Ensure timestamp column is datetime
+        matched_df_copy = matched_df.copy()
+        matched_df_copy[timestamp_col] = pd.to_datetime(matched_df_copy[timestamp_col])
+
+        # Calculate duration for each port visit
+        duration_stats = matched_df.groupby(['mmsi', 'portName']).agg({
+            timestamp_col: ['min', 'max']
+        }).reset_index()
+
+        duration_stats.columns = ['mmsi', 'portName', 'entry_time', 'exit_time']
+        duration_stats['duration_hours'] = (
+            (duration_stats['exit_time'] - duration_stats['entry_time']).dt.total_seconds() / 3600
+        )
+
+        return duration_stats
 
     def add_port_call_counts(self, matched_df):
         """
@@ -74,7 +129,7 @@ class PortMatcher:
         self.ports.plot(
             ax=ax,
             alpha=0.6,
-            markersize=self.ports['port_call_count'] * 10 + 20,  # scale marker size by call count
+            markersize=self.ports['port_call_count'] * 10,  # scale marker size by call count
             color='red',
             edgecolor='red',
             linewidth=0.5,
