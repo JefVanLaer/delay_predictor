@@ -75,6 +75,9 @@ class VoyageCreator:
                     'duration_hours': duration,
                 })
 
+        if not records:
+            return pd.DataFrame(columns=['mmsi', 'portName', 'entry_time', 'exit_time', 'duration_hours'])
+
         return (
             pd.DataFrame(records)
             .sort_values(['mmsi', 'entry_time'])
