@@ -8,9 +8,9 @@ class VoyageCreator:
     Builds a voyage dataset from AIS tracking data and a port reference GeoDataFrame.
 
     A voyage is the sea leg between two consecutive port visits for the same vessel.
-    Port visits are detected using PortMatcher's spatial join (speed + proximity
-    filters) and then split on time gaps so that repeated visits to the same port
-    across sparse AIS snapshot files are kept as separate events.
+    Port visits are detected via PortMatcher.find_port_visits(), which applies spatial,
+    speed, and gap-based filters. VoyageCreator then labels every AIS ping with
+    routing context and groups consecutive visits into voyage records.
 
     Parameters
     ----------
@@ -34,9 +34,8 @@ class VoyageCreator:
         """
         Return a DataFrame of individual port visits derived from AIS data.
 
-        Each row represents one contiguous stay at a port. Stays are split when
-        consecutive pings for the same (mmsi, portName) are more than
-        gap_threshold_h hours apart.
+        Delegates to PortMatcher.find_port_visits() using this instance's
+        gap_threshold_h. Each row represents one contiguous stay at a port.
 
         Parameters
         ----------
@@ -49,39 +48,10 @@ class VoyageCreator:
         -------
         DataFrame with columns: mmsi, portName, entry_time, exit_time, duration_hours
         """
-        near_port = self.matcher.find_candidates(ais_df, timestamp_col=timestamp_col)
-        return self._split_visits(near_port, timestamp_col)
-
-    def _split_visits(self, near_port_df, timestamp_col):
-        """
-        Split matched pings into individual visits using time-gap detection.
-        """
-        records = []
-        for (mmsi, portName), grp in near_port_df.groupby(['mmsi', 'portName']):
-            grp = grp.sort_values(timestamp_col)
-
-            gap_hours = grp[timestamp_col].diff().dt.total_seconds() / 3600
-            visit_num = (gap_hours > self.gap_threshold_h).cumsum()
-
-            for _, visit in grp.groupby(visit_num):
-                entry    = visit[timestamp_col].min()
-                exit_    = visit[timestamp_col].max()
-                duration = (exit_ - entry).total_seconds() / 3600
-                records.append({
-                    'mmsi':           mmsi,
-                    'portName':       portName,
-                    'entry_time':     entry,
-                    'exit_time':      exit_,
-                    'duration_hours': duration,
-                })
-
-        if not records:
-            return pd.DataFrame(columns=['mmsi', 'portName', 'entry_time', 'exit_time', 'duration_hours'])
-
-        return (
-            pd.DataFrame(records)
-            .sort_values(['mmsi', 'entry_time'])
-            .reset_index(drop=True)
+        return self.matcher.find_port_visits(
+            ais_df,
+            gap_threshold_h=self.gap_threshold_h,
+            timestamp_col=timestamp_col,
         )
 
     @staticmethod
