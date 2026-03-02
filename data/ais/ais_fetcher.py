@@ -3,7 +3,7 @@ This script sources AIS data from the NOAA HTTPS server. It works as follows:
 1. For each date in the requested range, construct the download URL.
 2. Download the daily .csv.zst file (Zstandard-compressed CSV).
 3. Stream-decompress and filter for cargo vessels (vessel_type 70-79).
-4. Save the filtered data as a CSV file for further use.
+4. Save the filtered data as a Parquet file for further use.
 
 Usage:
     python ais_fetcher.py --start 2025-01-01 --end 2025-01-31
@@ -100,7 +100,7 @@ def main():
 
     for current_date in _date_range(start, end):
         filename    = f"ais-{current_date.isoformat()}.csv.zst"
-        output_path = output_dir / f"ais-{current_date.isoformat()}.csv"
+        output_path = output_dir / f"ais-{current_date.isoformat()}.parquet"
         url         = BASE_URL.format(year=current_date.year) + filename
 
         if output_path.exists():
@@ -128,7 +128,7 @@ def main():
             print(f"[skip]     No cargo vessels found in {filename}\n")
             continue
 
-        df.to_csv(output_path, index=False)
+        df.to_parquet(output_path, index=False)
         print(f"[saved]    {output_path}  ({len(df):,} cargo vessel rows)\n")
 
     print("Done.")
