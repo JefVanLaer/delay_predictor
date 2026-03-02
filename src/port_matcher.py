@@ -55,66 +55,98 @@ class PortMatcher:
             predicate='within'
         )
 
-    def match(self, ais_df, lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
+    def find_port_visits(self, ais_df, gap_threshold_h=24,
+                         lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
         """
-        For each AIS record, find the nearest port within radius_m
-        where SOG is below max_speed. Takes a pandas DataFrame with
-        latitude and longitude columns. Returns GeoDataFrame with a new
-        portName column.
+        Return a DataFrame of individual port visits derived from AIS data.
+
+        Each row represents one contiguous stay at a port. Consecutive pings
+        for the same (mmsi, portName) that are separated by more than
+        gap_threshold_h hours are treated as separate visits. Making this
+        suitable for sparse AIS datasets where the same vessel may appear at
+        the same port across multiple snapshot files.
 
         Parameters:
         -----------
         ais_df : pandas.DataFrame
             Input AIS data
+        gap_threshold_h : float
+            Hour gap between consecutive pings that triggers a new visit (default: 24).
         lat_col : str
             Name of latitude column (default: 'latitude')
         lon_col : str
             Name of longitude column (default: 'longitude')
         timestamp_col : str
-            Name of timestamp column. If provided, will be converted to datetime
-        """
-        matched = self.find_candidates(ais_df, lat_col=lat_col, lon_col=lon_col, timestamp_col=timestamp_col)
-
-        # Filter to only stays longer than min_time_in_port
-        matched_with_duration = self.calculate_port_duration(matched, timestamp_col=timestamp_col)
-        filtered = matched_with_duration[matched_with_duration['duration_hours'] >= self.min_time_in_port]
-
-        # return unique mmsi and portName combinations
-        return filtered[['mmsi', 'portName']].drop_duplicates()
-
-    @staticmethod
-    def calculate_port_duration(matched_df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
-        """
-        Calculate the duration of stay in port for each matched port visit.
-        Filters the matches to only include stays longer than self.min_time_in_port (in hours).
-
-        Parameters:
-        -----------
-        matched_df : pandas.DataFrame
-            Output from match() method with 'mmsi' and 'portName' columns
-        timestamp_col : str
-            Name of the timestamp column (default: 'timestamp')
+            Name of timestamp column (default: 'base_date_time')
 
         Returns:
         --------
-        pandas.DataFrame
-            DataFrame with duration_hours column
+        DataFrame with columns: mmsi, portName, entry_time, exit_time, duration_hours
         """
-        # Ensure timestamp column is datetime
-        matched_df_copy = matched_df.copy()
-        matched_df_copy[timestamp_col] = pd.to_datetime(matched_df_copy[timestamp_col])
+        candidates = self.find_candidates(ais_df, lat_col=lat_col, lon_col=lon_col, timestamp_col=timestamp_col)
 
-        # Calculate duration for each port visit
-        duration_stats = matched_df.groupby(['mmsi', 'portName']).agg({
-            timestamp_col: ['min', 'max']
-        }).reset_index()
+        records = []
+        for (mmsi, portName), grp in candidates.groupby(['mmsi', 'portName']):
+            grp = grp.sort_values(timestamp_col)
+            gap_hours = grp[timestamp_col].diff().dt.total_seconds() / 3600
+            visit_num = (gap_hours > gap_threshold_h).cumsum()
 
-        duration_stats.columns = ['mmsi', 'portName', 'entry_time', 'exit_time']
-        duration_stats['duration_hours'] = (
-            (duration_stats['exit_time'] - duration_stats['entry_time']).dt.total_seconds() / 3600
+            for _, visit in grp.groupby(visit_num):
+                entry    = visit[timestamp_col].min()
+                exit_    = visit[timestamp_col].max()
+                duration = (exit_ - entry).total_seconds() / 3600
+                records.append({
+                    'mmsi':           mmsi,
+                    'portName':       portName,
+                    'entry_time':     entry,
+                    'exit_time':      exit_,
+                    'duration_hours': duration,
+                })
+
+        if not records:
+            return pd.DataFrame(columns=['mmsi', 'portName', 'entry_time', 'exit_time', 'duration_hours'])
+
+        return (
+            pd.DataFrame(records)
+            .sort_values(['mmsi', 'entry_time'])
+            .reset_index(drop=True)
         )
 
-        return duration_stats
+    def match(self, ais_df, gap_threshold_h=24, lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
+        """
+        Return unique (mmsi, portName) pairs for vessels that spent at least
+        min_time_in_port hours at a port.
+
+        Uses gap-aware visit splitting so that sparse AIS snapshots with the
+        same vessel at the same port months apart are not merged into a single
+        artificially long stay.
+
+        Parameters:
+        -----------
+        ais_df : pandas.DataFrame
+            Input AIS data
+        gap_threshold_h : float
+            Hour gap that splits a continuous stay into separate visits (default: 24).
+        lat_col : str
+            Name of latitude column (default: 'latitude')
+        lon_col : str
+            Name of longitude column (default: 'longitude')
+        timestamp_col : str
+            Name of timestamp column (default: 'base_date_time')
+        """
+        visits = self.find_port_visits(
+            ais_df,
+            gap_threshold_h=gap_threshold_h,
+            lat_col=lat_col,
+            lon_col=lon_col,
+            timestamp_col=timestamp_col,
+        )
+
+        if visits.empty:
+            return pd.DataFrame(columns=['mmsi', 'portName'])
+
+        filtered = visits[visits['duration_hours'] >= self.min_time_in_port]
+        return filtered[['mmsi', 'portName']].drop_duplicates().reset_index(drop=True)
 
     def add_port_call_counts(self, matched_df):
         """
@@ -196,4 +228,3 @@ class PortMatcher:
         ).add_to(m)
 
         return m
-

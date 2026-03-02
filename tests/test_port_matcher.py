@@ -97,51 +97,62 @@ class TestMatch:
 
 
 # ---------------------------------------------------------------------------
-# calculate_port_duration()
+# find_port_visits()
 # ---------------------------------------------------------------------------
 
-class TestCalculatePortDuration:
-    def test_duration_is_correct(self):
-        df = pd.DataFrame(
-            {
-                "mmsi": [111, 111],
-                "portName": ["A", "A"],
-                "base_date_time": [BASE_TIME, BASE_TIME + timedelta(hours=4)],
-            }
-        )
-        result = PortMatcher.calculate_port_duration(df, timestamp_col="base_date_time")
+class TestFindPortVisits:
+    def test_returns_expected_columns(self, matcher):
+        ais = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5)
+        result = matcher.find_port_visits(ais)
+        assert set(result.columns) >= {"mmsi", "portName", "entry_time", "exit_time", "duration_hours"}
 
-        assert "duration_hours" in result.columns
-        assert result.iloc[0]["duration_hours"] == pytest.approx(4.0)
+    def test_visit_entry_exit_and_duration_are_correct(self, matcher):
+        ais = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5, n_hours=5)
+        result = matcher.find_port_visits(ais)
+        row = result.iloc[0]
+        assert row["entry_time"] == pd.Timestamp(BASE_TIME)
+        assert row["exit_time"]  == pd.Timestamp(BASE_TIME + timedelta(hours=4))
+        assert row["duration_hours"] == pytest.approx(4.0)
 
-    def test_duration_computed_per_mmsi_and_port(self):
-        df = pd.DataFrame(
-            {
-                "mmsi":          [111, 111, 222],
-                "portName":      ["A",  "A",  "B"],
-                "base_date_time": [
-                    BASE_TIME,
-                    BASE_TIME + timedelta(hours=6),
-                    BASE_TIME + timedelta(hours=2),
-                ],
-            }
-        )
-        result = PortMatcher.calculate_port_duration(df, timestamp_col="base_date_time")
-
-        assert len(result) == 2
-        row_a = result.loc[result["portName"] == "A"].iloc[0]
-        assert row_a["duration_hours"] == pytest.approx(6.0)
-
-    def test_single_record_has_zero_duration(self):
-        df = pd.DataFrame(
-            {
-                "mmsi": [111],
-                "portName": ["A"],
-                "base_date_time": [BASE_TIME],
-            }
-        )
-        result = PortMatcher.calculate_port_duration(df, timestamp_col="base_date_time")
+    def test_single_ping_has_zero_duration(self, matcher):
+        ais = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5, n_hours=1)
+        result = matcher.find_port_visits(ais)
         assert result.iloc[0]["duration_hours"] == pytest.approx(0.0)
+
+    def test_gap_larger_than_threshold_splits_into_two_visits(self, matcher):
+        block1 = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5, n_hours=3)
+        block2 = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5, n_hours=3)
+        block2["base_date_time"] = block2["base_date_time"] + timedelta(hours=48)
+        ais = pd.concat([block1, block2], ignore_index=True)
+        result = matcher.find_port_visits(ais, gap_threshold_h=24)
+        assert len(result) == 2
+
+    def test_gap_smaller_than_threshold_stays_one_visit(self, matcher):
+        block1 = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5, n_hours=3)
+        block2 = _ais_df(mmsi=111, lon=-74.0, lat=40.7, sog=0.5, n_hours=3)
+        block2["base_date_time"] = block2["base_date_time"] + timedelta(hours=5)
+        ais = pd.concat([block1, block2], ignore_index=True)
+        result = matcher.find_port_visits(ais, gap_threshold_h=24)
+        assert len(result) == 1
+
+    def test_fast_vessel_produces_no_visits(self, matcher):
+        ais = _ais_df(mmsi=222, lon=-74.0, lat=40.7, sog=5.0)
+        assert len(matcher.find_port_visits(ais)) == 0
+
+    def test_vessel_outside_radius_produces_no_visits(self, matcher):
+        ais = _ais_df(mmsi=333, lon=-76.0, lat=40.7, sog=0.5)
+        assert len(matcher.find_port_visits(ais)) == 0
+
+    def test_empty_ais_returns_empty(self, matcher):
+        ais = pd.DataFrame(columns=["mmsi", "longitude", "latitude", "sog", "base_date_time"])
+        assert len(matcher.find_port_visits(ais)) == 0
+
+    def test_visits_computed_per_mmsi_and_port(self, matcher):
+        ais1 = _ais_df(mmsi=111, lon=-74.0,   lat=40.7, sog=0.5)   # NewYorkPort
+        ais2 = _ais_df(mmsi=222, lon=-118.2,  lat=33.7, sog=0.5)   # LosAngelesPort
+        result = matcher.find_port_visits(pd.concat([ais1, ais2], ignore_index=True))
+        assert len(result) == 2
+        assert set(result["portName"]) == {"NewYorkPort", "LosAngelesPort"}
 
 
 # ---------------------------------------------------------------------------
