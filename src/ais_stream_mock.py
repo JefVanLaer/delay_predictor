@@ -20,6 +20,7 @@ Script usage (newline-delimited JSON on stdout)::
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -152,6 +153,7 @@ def _parse_args():
 
 
 if __name__ == "__main__":
+    os.chdir(Path(__file__).resolve().parent.parent)
     args = _parse_args()
     mock = AISStreamMock(
         parquet_path=args.parquet,
