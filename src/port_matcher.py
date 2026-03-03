@@ -85,32 +85,41 @@ class PortMatcher:
         """
         candidates = self.find_candidates(ais_df, lat_col=lat_col, lon_col=lon_col, timestamp_col=timestamp_col)
 
-        records = []
-        for (mmsi, portName), grp in candidates.groupby(['mmsi', 'portName']):
-            grp = grp.sort_values(timestamp_col)
-            gap_hours = grp[timestamp_col].diff().dt.total_seconds() / 3600
-            visit_num = (gap_hours > gap_threshold_h).cumsum()
-
-            for _, visit in grp.groupby(visit_num):
-                entry    = visit[timestamp_col].min()
-                exit_    = visit[timestamp_col].max()
-                duration = (exit_ - entry).total_seconds() / 3600
-                records.append({
-                    'mmsi':           mmsi,
-                    'portName':       portName,
-                    'entry_time':     entry,
-                    'exit_time':      exit_,
-                    'duration_hours': duration,
-                })
-
-        if not records:
+        if candidates.empty:
             return pd.DataFrame(columns=['mmsi', 'portName', 'entry_time', 'exit_time', 'duration_hours'])
 
-        return (
-            pd.DataFrame(records)
-            .sort_values(['mmsi', 'entry_time'])
+        candidates = candidates.sort_values(['mmsi', 'portName', timestamp_col])
+
+        gap_hours = (
+            candidates.groupby(['mmsi', 'portName'])[timestamp_col]
+            .diff()
+            .dt.total_seconds()
+            .div(3600)
+        )
+
+        # New visit when the (mmsi, portName) group changes or the gap exceeds the threshold
+        group_change = (
+            candidates[['mmsi', 'portName']]
+            .ne(candidates[['mmsi', 'portName']].shift())
+            .any(axis=1)
+        )
+        candidates['_visit_id'] = (group_change | (gap_hours > gap_threshold_h)).cumsum()
+
+        visits = (
+            candidates.groupby('_visit_id', sort=False)
+            .agg(
+                mmsi=('mmsi', 'first'),
+                portName=('portName', 'first'),
+                entry_time=(timestamp_col, 'min'),
+                exit_time=(timestamp_col, 'max'),
+            )
             .reset_index(drop=True)
         )
+        visits['duration_hours'] = (
+            (visits['exit_time'] - visits['entry_time']).dt.total_seconds() / 3600
+        )
+
+        return visits.sort_values(['mmsi', 'entry_time']).reset_index(drop=True)
 
     def match(self, ais_df, gap_threshold_h=24, lat_col='latitude', lon_col='longitude', timestamp_col='base_date_time'):
         """
