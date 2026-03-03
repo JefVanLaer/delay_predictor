@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 from src.port_matcher import PortMatcher
@@ -78,29 +79,30 @@ class VoyageCreator:
         -------
         DataFrame — copy of ais_df with four new columns.
         """
-        ais_df = ais_df.copy()
-        ais_df[timestamp_col] = pd.to_datetime(ais_df[timestamp_col])
+        df = ais_df.copy()
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+
+        # Sort globally by timestamp (required by merge_asof's monotone 'on' column).
+        pings_sorted    = df.sort_values(timestamp_col).reset_index(drop=True)
+        visits_by_entry = port_visits[['mmsi', 'portName', 'entry_time', 'exit_time']].sort_values('entry_time')
+        visits_by_exit  = port_visits[['mmsi', 'portName', 'exit_time']].sort_values('exit_time')
 
         # --- current_port ---
-        in_visit = (
-            ais_df[['mmsi', timestamp_col]]
-            .merge(port_visits[['mmsi', 'portName', 'entry_time', 'exit_time']], on='mmsi', how='left')
-            .query('entry_time <= base_date_time <= exit_time')[['mmsi', timestamp_col, 'portName']]
-            .drop_duplicates(['mmsi', timestamp_col])
+        # Replace the O(N×M) cartesian merge+filter with an O(N log N) merge_asof.
+        # Find each ping's most-recent visit whose entry_time ≤ ping timestamp, then
+        # confirm the ping also falls within that visit's exit_time window.
+        current = pd.merge_asof(
+            pings_sorted[['mmsi', timestamp_col]],
+            visits_by_entry.rename(columns={'portName': 'current_port'}),
+            by='mmsi', left_on=timestamp_col, right_on='entry_time', direction='backward',
         )
-        df = ais_df.merge(
-            in_visit.rename(columns={'portName': 'current_port'}),
-            on=['mmsi', timestamp_col],
-            how='left',
+        in_visit_mask = (
+            current['exit_time'].notna().values
+            & (pings_sorted[timestamp_col].values <= current['exit_time'].values)
         )
+        pings_sorted['current_port'] = current['current_port'].where(in_visit_mask)
 
         # --- origin_port / destination_port ---
-        # merge_asof requires the 'on' column to be globally monotone, so sort by
-        # timestamp alone (not by mmsi first); by='mmsi' handles per-vessel grouping.
-        pings_sorted        = df.sort_values(timestamp_col).reset_index(drop=True)
-        visits_by_exit      = port_visits[['mmsi', 'portName', 'exit_time' ]].sort_values('exit_time' )
-        visits_by_entry     = port_visits[['mmsi', 'portName', 'entry_time']].sort_values('entry_time')
-
         origin = pd.merge_asof(
             pings_sorted[['mmsi', timestamp_col]],
             visits_by_exit.rename(columns={'portName': 'origin_port'}),
@@ -109,7 +111,7 @@ class VoyageCreator:
 
         destination = pd.merge_asof(
             pings_sorted[['mmsi', timestamp_col]],
-            visits_by_entry.rename(columns={'portName': 'destination_port'}),
+            visits_by_entry[['mmsi', 'portName', 'entry_time']].rename(columns={'portName': 'destination_port'}),
             by='mmsi', left_on=timestamp_col, right_on='entry_time', direction='forward',
         )['destination_port']
 
@@ -151,7 +153,21 @@ class VoyageCreator:
         voyage_records    = []
         voyage_id_counter = 0
 
+        # Sort once so each vessel's pings form a contiguous, time-ordered block.
+        # This lets us locate per-vessel slices and voyage windows with binary search
+        # instead of scanning the full DataFrame for every voyage (O(V·N) → O(N + V log N)).
+        df_labeled = df_labeled.sort_values(['mmsi', timestamp_col]).reset_index(drop=True)
+
+        mmsi_arr      = df_labeled['mmsi'].values
+        ts_arr        = df_labeled[timestamp_col].values
+        voyage_id_col = df_labeled.columns.get_loc('voyage_id')
+
         for mmsi, visits in port_visits.groupby('mmsi'):
+            # Find this vessel's contiguous row range via binary search on the sorted mmsi array.
+            v_start   = int(np.searchsorted(mmsi_arr, mmsi, side='left'))
+            v_end     = int(np.searchsorted(mmsi_arr, mmsi, side='right'))
+            vessel_ts = ts_arr[v_start:v_end]
+
             visits_sorted = visits.sort_values('entry_time').reset_index(drop=True)
 
             for i in range(len(visits_sorted) - 1):
@@ -162,12 +178,13 @@ class VoyageCreator:
                 if arr['entry_time'] <= dep['exit_time']:
                     continue
 
-                sea_mask = (
-                    (df_labeled['mmsi'] == mmsi)
-                    & (df_labeled[timestamp_col] > dep['exit_time'])
-                    & (df_labeled[timestamp_col] < arr['entry_time'])
-                )
-                df_labeled.loc[sea_mask, 'voyage_id'] = voyage_id_counter
+                # Binary search for the sea-ping window: dep.exit_time < ts < arr.entry_time
+                lo = int(np.searchsorted(vessel_ts, dep['exit_time'], side='right'))
+                hi = int(np.searchsorted(vessel_ts, arr['entry_time'], side='left'))
+                ping_count = hi - lo
+
+                if ping_count > 0:
+                    df_labeled.iloc[v_start + lo : v_start + hi, voyage_id_col] = voyage_id_counter
 
                 voyage_records.append({
                     'voyage_id':      voyage_id_counter,
@@ -177,7 +194,7 @@ class VoyageCreator:
                     'arrival_port':   arr['portName'],
                     'arrival_time':   arr['entry_time'],
                     'duration_hours': (arr['entry_time'] - dep['exit_time']).total_seconds() / 3600,
-                    'ping_count':     int(sea_mask.sum()),
+                    'ping_count':     ping_count,
                 })
                 voyage_id_counter += 1
 
