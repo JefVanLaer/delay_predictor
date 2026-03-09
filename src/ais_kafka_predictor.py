@@ -329,6 +329,11 @@ class AISKafkaPredictor:
         X = df_latest[_NUM_FEATURES + _CAT_FEATURES]
         predictions = self._model.predict(X)
 
+        # Remaining travel time is physically bounded below by zero.
+        # HistGradientBoostingRegressor is unconstrained and can extrapolate
+        # below zero near the end of a voyage; clip to prevent nonsensical outputs.
+        predictions = np.maximum(predictions, 0.0)
+
         # Update vessel registry
         ts_col = self.timestamp_col
         for row, pred in zip(df_latest.itertuples(index=False), predictions):
