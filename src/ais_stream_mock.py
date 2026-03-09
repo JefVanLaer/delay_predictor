@@ -1,7 +1,8 @@
 """AIS Stream Mock — replays AIS data from a Parquet file as timed JSON messages.
 
-Each row in the Parquet file is emitted as a JSON object to stdout at a pace
-controlled by the timestamps in the data and a configurable speed_factor.
+Each row in the Parquet file is emitted as a JSON object, either to stdout or
+to a Kafka topic, at a pace controlled by the timestamps in the data and a
+configurable speed_factor.
 
 Programmatic usage::
 
@@ -11,11 +12,19 @@ Programmatic usage::
     for message in mock.stream():
         process(message)          # dict with AIS fields
 
-Script usage (newline-delimited JSON on stdout)::
+Script usage — newline-delimited JSON on stdout::
 
     python src/ais_stream_mock.py \\
         --parquet data/ais/ais-2025-01-01.parquet \\
         --speed-factor 60
+
+Script usage — publish to Kafka::
+
+    python src/ais_stream_mock.py \\
+        --parquet data/ais/ais-2025-01-01.parquet \\
+        --speed-factor 60 \\
+        --kafka-brokers localhost:9092 \\
+        --topic ais-stream
 """
 
 import argparse
@@ -117,6 +126,36 @@ class AISStreamMock:
             output.write(json.dumps(msg, cls=_AISEncoder) + "\n")
             output.flush()
 
+    def run_kafka(self, bootstrap_servers, topic):
+        """
+        Publish all records as JSON to a Kafka topic.
+
+        Each AIS record is serialised with :class:`_AISEncoder` and sent as a
+        UTF-8 encoded byte message.  The vessel MMSI is used as the message key
+        so that records for the same vessel are routed to the same partition.
+
+        Parameters
+        ----------
+        bootstrap_servers : str or list of str
+            Kafka broker address(es), e.g. ``'localhost:9092'``.
+        topic : str
+            Destination Kafka topic, e.g. ``'ais-stream'``.
+        """
+        from kafka import KafkaProducer  # imported lazily — not needed for stdout mode
+
+        producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v, cls=_AISEncoder).encode("utf-8"),
+            key_serializer=lambda k: str(k).encode("utf-8") if k is not None else None,
+        )
+        try:
+            for msg in self.stream():
+                key = msg.get("mmsi")
+                producer.send(topic, value=msg, key=key)
+        finally:
+            producer.flush()
+            producer.close()
+
 
 # ---------------------------------------------------------------------------
 # CLI entry-point
@@ -149,6 +188,21 @@ def _parse_args():
         metavar="COL",
         help="Timestamp column name in the Parquet file.",
     )
+    parser.add_argument(
+        "--kafka-brokers",
+        default=None,
+        metavar="BROKERS",
+        help=(
+            "Comma-separated Kafka broker address(es), e.g. 'localhost:9092'. "
+            "When supplied, records are published to Kafka instead of stdout."
+        ),
+    )
+    parser.add_argument(
+        "--topic",
+        default="ais-stream",
+        metavar="TOPIC",
+        help="Kafka topic to publish to (used with --kafka-brokers).",
+    )
     return parser.parse_args()
 
 
@@ -160,4 +214,8 @@ if __name__ == "__main__":
         speed_factor=args.speed_factor,
         timestamp_col=args.timestamp_col,
     )
-    mock.run()
+    if args.kafka_brokers:
+        brokers = [b.strip() for b in args.kafka_brokers.split(",")]
+        mock.run_kafka(bootstrap_servers=brokers, topic=args.topic)
+    else:
+        mock.run()
